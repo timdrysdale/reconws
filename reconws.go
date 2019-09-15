@@ -21,7 +21,6 @@ package reconws
 import (
 	"math/rand"
 	"net/url"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -46,8 +45,6 @@ type ReconWs struct {
 	Stats           *chanstats.ChanStats
 	Stop            chan struct{}
 	Url             string
-	Wg              *sync.WaitGroup
-
 	// internal usage only
 	close     chan struct{}
 	connected chan struct{}
@@ -70,9 +67,9 @@ func New() *ReconWs {
 		Stop:            make(chan struct{}),
 		ForwardIncoming: true,
 		Err:             nil,
-		Retry: RetryConfig{Factor: 1.5,
-			Min:     time.Second,
-			Max:     60 * time.Second,
+		Retry: RetryConfig{Factor: 2,
+			Min:     100 * time.Millisecond,
+			Max:     10 * time.Second,
 			Timeout: 1 * time.Second,
 			Jitter:  true},
 		Stats: chanstats.New(),
@@ -95,10 +92,9 @@ func (r *ReconWs) Reconnect() {
 
 	// try dialling ....
 
-	r.connected = make(chan struct{}) //reset our connection indicator
-	r.close = make(chan struct{})
-
 	for {
+		r.connected = make(chan struct{}) //reset our connection indicator
+		r.close = make(chan struct{})
 
 		nextRetryWait := boff.Duration()
 
@@ -148,7 +144,6 @@ func (r *ReconWs) Dial() {
 	var err error
 
 	defer func() {
-		r.Wg.Done()
 		r.Err = err
 	}()
 
