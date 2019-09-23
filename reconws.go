@@ -68,10 +68,10 @@ func New() *ReconWs {
 		ForwardIncoming: true,
 		Err:             nil,
 		Retry: RetryConfig{Factor: 2,
-			Min:     100 * time.Millisecond,
+			Min:     1 * time.Second,
 			Max:     10 * time.Second,
 			Timeout: 1 * time.Second,
-			Jitter:  true},
+			Jitter:  false},
 		Stats: chanstats.New(),
 	}
 	return r
@@ -96,15 +96,13 @@ func (r *ReconWs) Reconnect() {
 		r.connected = make(chan struct{}) //reset our connection indicator
 		r.close = make(chan struct{})
 
-		nextRetryWait := boff.Duration()
-
 		//refresh these indicators each attempt
 		stopped := make(chan struct{})
 
 		go func() {
 			r.Dial() //returns on error or if closed with close(r.Close)
-			log.Debug("Reconnect() stopped")
-			//close(stopped) //signal there was an issue
+			log.WithField("error", r.Err).Debug("Reconnect() stopped")
+			close(stopped)
 		}()
 
 		select {
@@ -114,6 +112,7 @@ func (r *ReconWs) Reconnect() {
 			//let the connection operate until an issue arises:
 			select {
 			case <-stopped: // connection closed, so reconnect
+				boff.Reset()
 			case <-r.Stop: // requested to stop, so disconnect
 				log.Debug("(r.Stop)ped after connecting")
 				close(r.close)
@@ -127,6 +126,8 @@ func (r *ReconWs) Reconnect() {
 			log.Debug("Timeout before connecting")
 			close(r.close)
 		}
+
+		nextRetryWait := boff.Duration()
 
 		time.Sleep(nextRetryWait)
 
@@ -192,7 +193,9 @@ func (r *ReconWs) Dial() {
 	done := make(chan struct{})
 
 	go func() {
-		defer close(done) // signal to writing task to exit if we exit first
+		defer func() {
+			close(done) // signal to writing task to exit if we exit first
+		}()
 		for {
 
 			mt, data, err := c.ReadMessage()
@@ -201,7 +204,7 @@ func (r *ReconWs) Dial() {
 			// because we've been instructed to exit
 			if err != nil {
 				log.WithField("error", err).Error("Reading")
-				return
+				break
 			}
 			// optionally forward messages
 			if r.ForwardIncoming {

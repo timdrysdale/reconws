@@ -23,33 +23,13 @@ func TestBackoff(t *testing.T) {
 		Jitter: false,
 	}
 
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
+	lowerBound := []float64{0.5, 1.5, 3.5, 7.5, 15.5, 29.5, 29.5, 29.5}
+	upperBound := []float64{1.5, 2.5, 4.5, 8.5, 16.5, 30.5, 30.5, 30.5}
 
-	b.Reset()
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	fmt.Printf("%s\n", b.Duration())
-	b.Reset()
-	lowerBound := []float64{0, 1.0, 2.0, 4.0, 8.0, 16.0, 29.0, 29.0}
-	upperBound := []float64{1.0, 2.0, 3.0, 6.0, 10.0, 18.0, 32.0, 32.0}
-	last := big.NewFloat(0.0)
-	actual := big.NewFloat(0.0)
 	for i := 0; i < len(lowerBound); i++ {
-		actual.Add(last, big.NewFloat(b.Duration().Seconds()))
-		last = actual
-		fmt.Printf("Desired timing: %f < %f < %f\n", lowerBound[i], actual, upperBound[i])
+
+		actual := big.NewFloat(b.Duration().Seconds())
+
 		if actual.Cmp(big.NewFloat(upperBound[i])) > 0 {
 			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted <%f\n", i, actual, upperBound[i])
 		}
@@ -104,10 +84,10 @@ func TestRetryTiming(t *testing.T) {
 
 	go r.Reconnect()
 
-	start := time.Now()
-
-	lowerBound := []float64{0, 1.0, 2.0, 4.0, 8.0, 16.0, 16.0, 16.0}
-	upperBound := []float64{2.0, 4.0, 8.0, 16.0, 35.0, 35.0, 35.0, 35.0}
+	// first failed connection should be immediate
+	// backoff with jitter means we quite can't be sure what the timings are
+	lowerBound := []float64{0.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0}
+	upperBound := []float64{1.5, 11.5, 11.5, 11.5, 11.5, 11.5, 11.5, 11.5}
 
 	iterations := len(lowerBound)
 
@@ -117,9 +97,68 @@ func TestRetryTiming(t *testing.T) {
 	}
 
 	for i := 0; i < iterations; i++ {
-		<-c
+
+		start := time.Now()
+
+		<-c // wait for deny handler to return a value (note: bad handshake due to use of deny handler)
+
 		actual := big.NewFloat(time.Since(start).Seconds())
-		fmt.Printf("Desired timing: %f < %f < %f\n", lowerBound[i], actual, upperBound[i])
+
+		if actual.Cmp(big.NewFloat(upperBound[i])) > 0 {
+			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted <%f\n", i, actual, upperBound[i])
+		}
+		if actual.Cmp(big.NewFloat(lowerBound[i])) < 0 {
+			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted >%f\n", i, actual, lowerBound[i])
+		}
+
+	}
+
+	close(r.Stop)
+
+}
+
+func TestReconnectAfterDisconnect(t *testing.T) {
+
+	r := New()
+
+	c := make(chan int)
+
+	n := 0
+
+	// Create test server with the echo handler.
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectAfterTrying(w, r, &n, 2, c)
+	}))
+	defer s.Close()
+
+	// Convert http://127.0.0.1 to ws://127.0.0.
+	r.Url = "ws" + strings.TrimPrefix(s.URL, "http")
+
+	go r.Reconnect()
+
+	// first failed connection should be immediate
+	// should connect on third try
+	// then next attempt after that should fail immediately
+	// backoff with jitter means we quite can't be sure what the timings are
+	// fail immediately, wait retry and fail, wait retry and connect, fail immediately, wait retry and fail
+	lowerBound := []float64{0.0, 1.5, 2.0, 0.0, 2.0}
+	upperBound := []float64{1.5, 11.5, 11.5, 1.5, 11.5}
+
+	iterations := len(lowerBound)
+
+	if testing.Short() {
+		fmt.Printf("Reducing length of test in short mode")
+		iterations = 5
+	}
+
+	for i := 0; i < iterations; i++ {
+
+		start := time.Now()
+
+		<-c // wait for deny handler to return a value (note: bad handshake due to use of deny handler)
+
+		actual := big.NewFloat(time.Since(start).Seconds())
+
 		if actual.Cmp(big.NewFloat(upperBound[i])) > 0 {
 			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted <%f\n", i, actual, upperBound[i])
 		}
@@ -155,4 +194,25 @@ func echo(w http.ResponseWriter, r *http.Request) {
 
 func deny(w http.ResponseWriter, r *http.Request, c chan int) {
 	c <- 0
+}
+
+func connectAfterTrying(w http.ResponseWriter, r *http.Request, n *int, connectAt int, c chan int) {
+
+	defer func() { *n += 1 }()
+
+	c <- *n
+
+	if *n == connectAt {
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+
+		defer conn.Close()
+
+		// immediately close
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+
+	}
 }
