@@ -95,6 +95,7 @@ func (r *ReconWs) Reconnect() {
 	for {
 		r.connected = make(chan struct{}) //reset our connection indicator
 		r.close = make(chan struct{})
+		doClose := false
 
 		//refresh these indicators each attempt
 		stopped := make(chan struct{})
@@ -112,18 +113,25 @@ func (r *ReconWs) Reconnect() {
 			//let the connection operate until an issue arises:
 			select {
 			case <-stopped: // connection closed, so reconnect
-				boff.Reset()
+				if r.Err != nil {
+					boff.Reset()
+				}
 			case <-r.Stop: // requested to stop, so disconnect
 				log.Debug("(r.Stop)ped after connecting")
-				close(r.close)
+				doClose = true
 				return
 			}
 		case <-r.Stop: //requested to stop
 			log.Debug("(r.Stop)ped before connecting")
-			close(r.close)
+			doClose = true
 			return
 		case <-time.After(r.Retry.Timeout): //too slow, retry
 			log.Debug("Timeout before connecting")
+			doClose = true
+
+		}
+
+		if doClose {
 			close(r.close)
 		}
 
@@ -202,8 +210,9 @@ func (r *ReconWs) Dial() {
 
 			// Check for errors, e.g. caused by writing task closing conn
 			// because we've been instructed to exit
+			// log as info since we expect an error here on a normal exit
 			if err != nil {
-				log.WithField("error", err).Error("Reading")
+				log.WithField("info", err).Info("Reading")
 				break
 			}
 			// optionally forward messages
@@ -228,7 +237,7 @@ func (r *ReconWs) Dial() {
 
 			err := c.WriteMessage(msg.Type, msg.Data)
 			if err != nil {
-				log.WithField("error", err).Fatal("Writing")
+				log.WithField("error", err).Error("Writing")
 				return
 			}
 			//update stats
