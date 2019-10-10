@@ -19,6 +19,8 @@
 package reconws
 
 import (
+	"context"
+	"errors"
 	"math/rand"
 	"net/url"
 	"time"
@@ -79,7 +81,11 @@ func New() *ReconWs {
 
 // run this in a separate goroutine so that the connection can be
 // ended from where it was initialised, by close((* ReconWs).Stop)
-func (r *ReconWs) Reconnect() {
+func (r *ReconWs) Reconnect(ctx context.Context) {
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	boff := &backoff.Backoff{
 		Min:    r.Retry.Min,
@@ -93,57 +99,32 @@ func (r *ReconWs) Reconnect() {
 	// try dialling ....
 
 	for {
-		r.connected = make(chan struct{}) //reset our connection indicator
-		r.close = make(chan struct{})
-
-		//refresh these indicators each attempt
-		stopped := make(chan struct{})
-
-		go func() {
-			r.Dial() //returns on error or if closed with close(r.Close)
-			log.WithField("error", r.Err).Debug("Reconnect() stopped")
-			close(stopped)
-		}()
 
 		select {
-
-		case <-r.connected: //good!
-			boff.Reset()
-			//let the connection operate until an issue arises:
-			select {
-			case <-stopped: // connection closed, so reconnect
-				if r.Err != nil {
-					boff.Reset()
-				}
-			case <-r.Stop: // requested to stop, so disconnect
-				log.Debug("(r.Stop)ped after connecting")
-				close(r.close) //doClose = true
-				return
-			}
-		case <-r.Stop: //requested to stop
-			log.Debug("(r.Stop)ped before connecting")
-			close(r.close) //doClose = true
+		case <-ctx.Done():
 			return
-		case <-time.After(r.Retry.Timeout): //too slow, retry
-			log.Debug("Timeout before connecting")
-			close(r.close)
+		default:
 
+			dialCtx, cancel := context.WithTimeout(ctx, r.Retry.Timeout)
+			defer cancel()
+			err := r.Dial(dialCtx)
+			cancel()
+			log.WithField("error", err).Debug("Dial finished")
+			if err == nil {
+				boff.Reset()
+			} else {
+				time.Sleep(boff.Duration())
+			}
+			//TODO immediate return if cancelled....
 		}
-
-		nextRetryWait := boff.Duration()
-
-		time.Sleep(nextRetryWait)
-
 	}
-
 }
 
 // Dial the websocket server once.
 // If dial fails then return immediately
 // If dial succeeds then handle message traffic until
-// (r *ReconWs).Close is closed (presumably by the caller)
-// or if there is a reading or writing error
-func (r *ReconWs) Dial() {
+// the context is cancelled
+func (r *ReconWs) Dial(ctx context.Context) error {
 
 	var err error
 
@@ -153,54 +134,52 @@ func (r *ReconWs) Dial() {
 
 	if r.Url == "" {
 		log.Error("Can't dial an empty Url")
-		return
+		return errors.New("Can't dial an empty Url")
 	}
 
 	u, err := url.Parse(r.Url)
 
 	if err != nil {
 		log.Error("Url:", err)
-		return
+		return err
 	}
 
 	if u.Scheme != "ws" && u.Scheme != "wss" {
 		log.Error("Url needs to start with ws or wss")
-		return
+		return errors.New("Url needs to start with ws or wss")
 	}
 
 	if u.User != nil {
 		log.Error("Url can't contain user name and password")
-		return
+		return errors.New("Url can't contain user name and password")
 	}
 
 	// start dialing ....
 
 	log.WithField("To", u).Debug("Connecting")
 
-	c, _, err := websocket.DefaultDialer.Dial(r.Url, nil)
+	//assume our context has been given a deadline if needed
+	c, _, err := websocket.DefaultDialer.DialContext(ctx, r.Url, nil)
+	//	defer c.Close()
 
 	if err != nil {
 		log.WithField("error", err).Error("Dialing")
-		return
+		return err
 	}
 
-	defer c.Close()
-
+	// assume we are conntected?
 	r.Stats.ConnectedAt = time.Now()
-	close(r.connected) //signal that we've connected
+	//close(r.connected) //signal that we've connected
 
 	log.WithField("To", u).Info("Connected")
 
 	// handle our reading tasks
 
-	done := make(chan struct{})
-
 	go func() {
-		defer func() {
-			close(done) // signal to writing task to exit if we exit first
-		}()
+	LOOP:
 		for {
 
+			//assume this will produce non-nil err on context.Done
 			mt, data, err := c.ReadMessage()
 
 			// Check for errors, e.g. caused by writing task closing conn
@@ -208,7 +187,7 @@ func (r *ReconWs) Dial() {
 			// log as info since we expect an error here on a normal exit
 			if err != nil {
 				log.WithField("info", err).Info("Reading")
-				break
+				break LOOP
 			}
 			// optionally forward messages
 			if r.ForwardIncoming {
@@ -222,26 +201,24 @@ func (r *ReconWs) Dial() {
 	}()
 
 	// handle our writing tasks
-
+LOOPWRITING:
 	for {
 		select {
-		case <-done:
-			return
 
 		case msg := <-r.Out:
 
 			err := c.WriteMessage(msg.Type, msg.Data)
 			if err != nil {
 				log.WithField("error", err).Error("Writing")
-				return
+				break LOOPWRITING
 			}
 			//update stats
 			r.Stats.Tx.Bytes.Add(float64(len(msg.Data)))
 			r.Stats.Tx.Dt.Add(time.Since(r.Stats.Tx.Last).Seconds())
 			r.Stats.Tx.Last = time.Now()
 
-		case <-r.close: // r.HandshakeTimout has probably expired
-
+		case <-ctx.Done(): // context has finished, either timeout or cancel
+			//TODO - do we need to do this?
 			// Cleanly close the connection by sending a close message
 			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			if err != nil {
@@ -249,7 +226,11 @@ func (r *ReconWs) Dial() {
 			} else {
 				log.Info("Closed")
 			}
-			return
+			c.Close()
+			break LOOPWRITING
 		}
 	}
+
+	return err
+
 }

@@ -1,18 +1,28 @@
 package reconws
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/jpillora/backoff"
+	log "github.com/sirupsen/logrus"
 )
+
+func init() {
+
+	log.SetLevel(log.PanicLevel)
+
+}
 
 func TestBackoff(t *testing.T) {
 
@@ -52,7 +62,7 @@ func TestWsEcho(t *testing.T) {
 	// Convert http://127.0.0.1 to ws://127.0.0.
 	r.Url = "ws" + strings.TrimPrefix(s.URL, "http")
 
-	go r.Reconnect()
+	go r.Reconnect(context.Background())
 
 	payload := []byte("Hello")
 	mtype := int(websocket.TextMessage)
@@ -68,6 +78,8 @@ func TestWsEcho(t *testing.T) {
 }
 
 func TestRetryTiming(t *testing.T) {
+	suppressLog()
+	defer displayLog()
 
 	r := New()
 
@@ -82,18 +94,24 @@ func TestRetryTiming(t *testing.T) {
 	// Convert http://127.0.0.1 to ws://127.0.0.
 	r.Url = "ws" + strings.TrimPrefix(s.URL, "http")
 
-	go r.Reconnect()
+	time.Sleep(time.Millisecond)
+
+	go r.Reconnect(context.Background())
 
 	// first failed connection should be immediate
 	// backoff with jitter means we quite can't be sure what the timings are
-	lowerBound := []float64{0.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0}
-	upperBound := []float64{1.5, 11.5, 11.5, 11.5, 11.5, 11.5, 11.5, 11.5}
+	lowerBound := []float64{0.0, 0.9, 1.9, 3.9, 7.9, 9.9, 9.9, 9.9}
+	upperBound := []float64{1.0, 1.1, 2.1, 4.1, 8.1, 10.1, 10.1, 10.1}
 
 	iterations := len(lowerBound)
 
 	if testing.Short() {
-		fmt.Printf("Reducing length of test in short mode")
+		fmt.Println("Reducing length of test in short mode")
 		iterations = 3
+	}
+
+	if testing.Verbose() {
+		fmt.Println("lower < actual < upper ok?")
 	}
 
 	for i := 0; i < iterations; i++ {
@@ -103,14 +121,20 @@ func TestRetryTiming(t *testing.T) {
 		<-c // wait for deny handler to return a value (note: bad handshake due to use of deny handler)
 
 		actual := big.NewFloat(time.Since(start).Seconds())
+		ok := true
 
 		if actual.Cmp(big.NewFloat(upperBound[i])) > 0 {
 			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted <%f\n", i, actual, upperBound[i])
+			ok = false
 		}
 		if actual.Cmp(big.NewFloat(lowerBound[i])) < 0 {
 			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted >%f\n", i, actual, lowerBound[i])
+			ok = false
 		}
 
+		if testing.Verbose() {
+			fmt.Printf("%0.2f < %0.2f < %0.2f %s\n", lowerBound[i], actual, upperBound[i], okString(ok))
+		}
 	}
 
 	close(r.Stop)
@@ -134,21 +158,25 @@ func TestReconnectAfterDisconnect(t *testing.T) {
 	// Convert http://127.0.0.1 to ws://127.0.0.
 	r.Url = "ws" + strings.TrimPrefix(s.URL, "http")
 
-	go r.Reconnect()
+	go r.Reconnect(context.Background())
 
 	// first failed connection should be immediate
 	// should connect on third try
 	// then next attempt after that should fail immediately
 	// backoff with jitter means we quite can't be sure what the timings are
 	// fail immediately, wait retry and fail, wait retry and connect, fail immediately, wait retry and fail
-	lowerBound := []float64{0.0, 1.5, 2.0, 0.0, 2.0}
-	upperBound := []float64{1.5, 11.5, 11.5, 1.5, 11.5}
+	lowerBound := []float64{0.0, 0.9, 1.9, 0.0, 0.9, 1.9}
+	upperBound := []float64{0.1, 1.1, 2.1, 1.1, 1.1, 2.1}
 
 	iterations := len(lowerBound)
 
 	if testing.Short() {
-		fmt.Printf("Reducing length of test in short mode")
-		iterations = 5
+		fmt.Println("Reducing length of test in short mode")
+		iterations = 6
+	}
+
+	if testing.Verbose() {
+		fmt.Println("lower < actual < upper ok?")
 	}
 
 	for i := 0; i < iterations; i++ {
@@ -158,14 +186,18 @@ func TestReconnectAfterDisconnect(t *testing.T) {
 		<-c // wait for deny handler to return a value (note: bad handshake due to use of deny handler)
 
 		actual := big.NewFloat(time.Since(start).Seconds())
-
+		ok := true
 		if actual.Cmp(big.NewFloat(upperBound[i])) > 0 {
 			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted <%f\n", i, actual, upperBound[i])
+			ok = false
 		}
 		if actual.Cmp(big.NewFloat(lowerBound[i])) < 0 {
 			t.Errorf("retry timing was incorrect, iteration %d, elapsed %f, wanted >%f\n", i, actual, lowerBound[i])
+			ok = false
 		}
-
+		if testing.Verbose() {
+			fmt.Printf("%0.2f < %0.2f < %0.2f %s\n", lowerBound[i], actual, upperBound[i], okString(ok))
+		}
 	}
 
 	close(r.Stop)
@@ -215,4 +247,23 @@ func connectAfterTrying(w http.ResponseWriter, r *http.Request, n *int, connectA
 		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 
 	}
+}
+
+func suppressLog() {
+	var ignore bytes.Buffer
+	logignore := bufio.NewWriter(&ignore)
+	log.SetOutput(logignore)
+}
+
+func displayLog() {
+	log.SetOutput(os.Stdout)
+}
+
+func okString(ok bool) string {
+	if ok {
+		return "  ok"
+	} else {
+		return "  FAILED"
+	}
+
 }
