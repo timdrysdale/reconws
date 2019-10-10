@@ -95,7 +95,6 @@ func (r *ReconWs) Reconnect() {
 	for {
 		r.connected = make(chan struct{}) //reset our connection indicator
 		r.close = make(chan struct{})
-		doClose := false
 
 		//refresh these indicators each attempt
 		stopped := make(chan struct{})
@@ -118,21 +117,17 @@ func (r *ReconWs) Reconnect() {
 				}
 			case <-r.Stop: // requested to stop, so disconnect
 				log.Debug("(r.Stop)ped after connecting")
-				doClose = true
+				close(r.close) //doClose = true
 				return
 			}
 		case <-r.Stop: //requested to stop
 			log.Debug("(r.Stop)ped before connecting")
-			doClose = true
+			close(r.close) //doClose = true
 			return
 		case <-time.After(r.Retry.Timeout): //too slow, retry
 			log.Debug("Timeout before connecting")
-			doClose = true
-
-		}
-
-		if doClose {
 			close(r.close)
+
 		}
 
 		nextRetryWait := boff.Duration()
