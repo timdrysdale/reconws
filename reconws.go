@@ -39,17 +39,12 @@ type WsMessage struct {
 // connects (retrying/reconnecting if necessary) to websocket server at url
 
 type ReconWs struct {
-	Err             error
 	ForwardIncoming bool
 	In              chan WsMessage
 	Out             chan WsMessage
 	Retry           RetryConfig
 	Stats           *chanstats.ChanStats
-	Stop            chan struct{}
 	Url             string
-	// internal usage only
-	close     chan struct{}
-	connected chan struct{}
 }
 
 type RetryConfig struct {
@@ -62,13 +57,9 @@ type RetryConfig struct {
 
 func New() *ReconWs {
 	r := &ReconWs{
-		Url:             "",
 		In:              make(chan WsMessage),
 		Out:             make(chan WsMessage),
-		close:           make(chan struct{}),
-		Stop:            make(chan struct{}),
 		ForwardIncoming: true,
-		Err:             nil,
 		Retry: RetryConfig{Factor: 2,
 			Min:     1 * time.Second,
 			Max:     10 * time.Second,
@@ -81,11 +72,7 @@ func New() *ReconWs {
 
 // run this in a separate goroutine so that the connection can be
 // ended from where it was initialised, by close((* ReconWs).Stop)
-func (r *ReconWs) Reconnect(ctx context.Context) {
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func (r *ReconWs) Reconnect(ctx context.Context, url string) {
 
 	boff := &backoff.Backoff{
 		Min:    r.Retry.Min,
@@ -105,10 +92,11 @@ func (r *ReconWs) Reconnect(ctx context.Context) {
 			return
 		default:
 
-			dialCtx, cancel := context.WithTimeout(ctx, r.Retry.Timeout)
-			defer cancel()
-			err := r.Dial(dialCtx)
+			dialCtx, cancel := context.WithCancel(ctx)
+			//defer cancel()
+			err := r.Dial(dialCtx, url)
 			cancel()
+
 			log.WithField("error", err).Debug("Dial finished")
 			if err == nil {
 				boff.Reset()
@@ -124,20 +112,17 @@ func (r *ReconWs) Reconnect(ctx context.Context) {
 // If dial fails then return immediately
 // If dial succeeds then handle message traffic until
 // the context is cancelled
-func (r *ReconWs) Dial(ctx context.Context) error {
+func (r *ReconWs) Dial(ctx context.Context, urlStr string) error {
 
 	var err error
 
-	defer func() {
-		r.Err = err
-	}()
-
-	if r.Url == "" {
+	if urlStr == "" {
 		log.Error("Can't dial an empty Url")
 		return errors.New("Can't dial an empty Url")
 	}
 
-	u, err := url.Parse(r.Url)
+	// parse to check, dial with original string
+	u, err := url.Parse(urlStr)
 
 	if err != nil {
 		log.Error("Url:", err)
@@ -159,7 +144,7 @@ func (r *ReconWs) Dial(ctx context.Context) error {
 	log.WithField("To", u).Debug("Connecting")
 
 	//assume our context has been given a deadline if needed
-	c, _, err := websocket.DefaultDialer.DialContext(ctx, r.Url, nil)
+	c, _, err := websocket.DefaultDialer.DialContext(ctx, urlStr, nil)
 	//	defer c.Close()
 
 	if err != nil {
@@ -175,11 +160,17 @@ func (r *ReconWs) Dial(ctx context.Context) error {
 
 	// handle our reading tasks
 
+	readClosed := make(chan struct{})
+
 	go func() {
 	LOOP:
 		for {
-
+			select {
+			case <-ctx.Done():
+			default:
+			}
 			//assume this will produce non-nil err on context.Done
+			//c.SetReadDeadline(time.Now().Add(time.Second))
 			mt, data, err := c.ReadMessage()
 
 			// Check for errors, e.g. caused by writing task closing conn
@@ -187,6 +178,7 @@ func (r *ReconWs) Dial(ctx context.Context) error {
 			// log as info since we expect an error here on a normal exit
 			if err != nil {
 				log.WithField("info", err).Info("Reading")
+				close(readClosed)
 				break LOOP
 			}
 			// optionally forward messages
@@ -204,7 +196,9 @@ func (r *ReconWs) Dial(ctx context.Context) error {
 LOOPWRITING:
 	for {
 		select {
-
+		case <-readClosed:
+			err = nil // nil error resets the backoff
+			break LOOPWRITING
 		case msg := <-r.Out:
 
 			err := c.WriteMessage(msg.Type, msg.Data)

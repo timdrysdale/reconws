@@ -60,9 +60,11 @@ func TestWsEcho(t *testing.T) {
 	defer s.Close()
 
 	// Convert http://127.0.0.1 to ws://127.0.0.
-	r.Url = "ws" + strings.TrimPrefix(s.URL, "http")
+	u := "ws" + strings.TrimPrefix(s.URL, "http")
 
-	go r.Reconnect(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	go r.Reconnect(ctx, u)
 
 	payload := []byte("Hello")
 	mtype := int(websocket.TextMessage)
@@ -74,6 +76,8 @@ func TestWsEcho(t *testing.T) {
 	if bytes.Compare(reply.Data, payload) != 0 {
 		t.Errorf("Got unexpected response: %s, wanted %s\n", reply.Data, payload)
 	}
+
+	time.Sleep(2 * time.Second)
 
 }
 
@@ -92,11 +96,11 @@ func TestRetryTiming(t *testing.T) {
 	defer s.Close()
 
 	// Convert http://127.0.0.1 to ws://127.0.0.
-	r.Url = "ws" + strings.TrimPrefix(s.URL, "http")
+	url := "ws" + strings.TrimPrefix(s.URL, "http")
 
-	time.Sleep(time.Millisecond)
-
-	go r.Reconnect(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Reconnect(ctx, url)
 
 	// first failed connection should be immediate
 	// backoff with jitter means we quite can't be sure what the timings are
@@ -137,8 +141,6 @@ func TestRetryTiming(t *testing.T) {
 		}
 	}
 
-	close(r.Stop)
-
 }
 
 func TestReconnectAfterDisconnect(t *testing.T) {
@@ -156,9 +158,10 @@ func TestReconnectAfterDisconnect(t *testing.T) {
 	defer s.Close()
 
 	// Convert http://127.0.0.1 to ws://127.0.0.
-	r.Url = "ws" + strings.TrimPrefix(s.URL, "http")
+	url := "ws" + strings.TrimPrefix(s.URL, "http")
 
-	go r.Reconnect(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) //, time.Second)
+	go r.Reconnect(ctx, url)
 
 	// first failed connection should be immediate
 	// should connect on third try
@@ -166,7 +169,7 @@ func TestReconnectAfterDisconnect(t *testing.T) {
 	// backoff with jitter means we quite can't be sure what the timings are
 	// fail immediately, wait retry and fail, wait retry and connect, fail immediately, wait retry and fail
 	lowerBound := []float64{0.0, 0.9, 1.9, 0.0, 0.9, 1.9}
-	upperBound := []float64{0.1, 1.1, 2.1, 1.1, 1.1, 2.1}
+	upperBound := []float64{0.1, 1.1, 2.1, 0.1, 1.1, 2.1}
 
 	iterations := len(lowerBound)
 
@@ -199,9 +202,7 @@ func TestReconnectAfterDisconnect(t *testing.T) {
 			fmt.Printf("%0.2f < %0.2f < %0.2f %s\n", lowerBound[i], actual, upperBound[i], okString(ok))
 		}
 	}
-
-	close(r.Stop)
-
+	cancel()
 }
 
 var upgrader = websocket.Upgrader{}
