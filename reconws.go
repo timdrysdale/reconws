@@ -170,7 +170,6 @@ func (r *ReconWs) Dial(ctx context.Context, urlStr string) error {
 			default:
 			}
 			//assume this will produce non-nil err on context.Done
-			//c.SetReadDeadline(time.Now().Add(time.Second))
 			mt, data, err := c.ReadMessage()
 
 			// Check for errors, e.g. caused by writing task closing conn
